@@ -1,0 +1,135 @@
+datadir = db
+fastq_dir = $(datadir)/raw_data
+python_bin = /local/cluster/bin/python
+
+bowtie_db = $(datadir)/tair10/db
+gff = $(datadir)/tair10/TAIR10_GFF3_genes.gff
+genome = $(datadir)/tair10/genome.fas
+pwm = $(datadir)/tair10/PWM_all.untrimmed.mat_MERGED
+
+pseudoCounts = 0.01
+
+prefix = 3peat_peat_original
+
+queues = megraw,bpp
+premadefiles = $(datadir)/alignments
+
+premade_peaks = $(datadir)/raw_peaks
+
+aligned_bam = $(premadefiles)/peat.sorted.bam
+
+skip_making_bams = 1
+
+nucs_up = 5000
+nucs_down = 5000
+
+negative_draw_start = -2000
+negative_draw_stop = -200
+negative_proportion = 20
+
+exonic_seqs = $(datadir)/TAIR10_coding_exons_FIRST_REMOVED.randDraws.N_22000.L_2000.fa
+whole_genome_seqs = $(datadir)/TAIR10_whole_genome.randDraws.N_6000.L_2000.fa
+
+all: %features_train_neg.rdat %features_test_neg.rdat
+##################################
+##
+##  1- Process alignments for tss seq and compute peaks
+##
+##################################
+
+%aligned.bam: $(aligned_bam)
+ifeq ($(skip_making_bams),1)
+	echo DEPS $*aligned.bam:
+	mkdir -p $(prefix)
+	echo ln -s ../$(premadefiles)/peat.sorted.bam $(prefix)/aligned.bam | \
+		SGE_Array -P 1 -q $(queues) -m 1G -r $(prefix)/j1_bowtie_logs
+else
+	echo DEPS $*aligned.bam: $(bowtie_db).1.ebwt
+endif
+
+%aligned.peaks: %aligned.bam
+	echo DEPS $*aligned.peaks: $*aligned.bam
+	echo java -Xmx9G -jar software/DavidPeakCallerV1.1/GenerateTSSsFromBAM.jar $(prefix)/aligned.bam $(prefix)/aligned.peaks 1\; rm -f Chr*.txt | \
+                SGE_Array -q $(queues) -m 20G -r $(prefix)/j2_peaks_logs --hold_names $(prefix)/j1_bowtie_logs
+
+%aligned.peaks.annotated: %aligned.peaks
+	echo DEPS $*aligned.peaks.annotated: $*aligned.peaks
+	echo software/annotate_TSS_peaks.pl -p -G $(gff) $(prefix)/aligned.peaks \> $(prefix)/aligned.peaks.annotated | \
+		SGE_Array -q $(queues) -m 5G -r $(prefix)/j3_annotate_peaks_logs --hold_names $(prefix)/j2_peaks_logs
+
+%aligned.peaks.annotated.filtered: %aligned.peaks.annotated
+	echo DEPS $*aligned.peaks.annotated.filtered: $*aligned.peaks.annotate
+	echo "cat $(prefix)/aligned.peaks.annotated | awk -F ',' '{if(NR == 1) {print \$$0\",Capped\"} else if( \$$9 == \"tss\" || \$$9 == \"<250\" || \$$9 == \"<500\" || \$$9 == \"5'\''utr\") { if (\$$5 > 100) {print \$$0\",100\"} }}' | awk -F ',' '{if(NR == 1) {print \$$0} else if(\$$10 == \"NA\") {print \$$1\",\"\$$2\",\"\$$3\",\"\$$4\",\"\$$5\",\"\$$6\",\"\$$7\",\"\$$8\",\"\$$9\",\"\$$11\".1\"\",\"\$$11\",\"\$$12\",\$$13\" } else {print \$$0} }' > $(prefix)/aligned.peaks.annotated.filtered" |\
+		SGE_Array -q $(queues) -m 5G -r $(prefix)/j4_filter_peaks_logs --hold_names $(prefix)/j3_annotate_peaks_logs
+
+################################
+###
+### 2- Generating ROEs
+###
+################################
+%peaks_5000_region.fa: %aligned.peaks.annotated.filtered
+	echo software/get_seqs.pl $(prefix)/aligned.peaks.annotated.filtered $(nucs_up) $(nucs_down) $(genome) \| software/dedup_fasta.sh \> $(prefix)/peaks_5000_region.fa |\
+		SGE_Array -q $(queues) -m 10G -r $(prefix)/j5_peaks_region_fasta_logs --hold_names $(prefix)/j4_filter_peaks_logs
+
+%roe_$(nucs_up).FWD.table %roe_$(nucs_up).REV.table: %peaks_5000_region.fa %negative_tags.locs
+	echo java -Xms100G -Xmx200G -jar software/tfbs_scan.jar ROEFinder --pseudoCounts $(pseudoCounts) -n 40 --plotDir $(prefix)/roe_plots $(pwm) $(prefix)/peaks_5000_region.fa $(prefix)/roe_$(nucs_up) \; rm -f $(prefix)/roe_plots/*.dist $(prefix)/roe_plots/*.table |\
+		SGE_Array -P 10 -q $(queues) -m 200G -r $(prefix)/j6_roefinder_logs --hold_names $(prefix)/j5_peaks_region_fasta_logs
+
+################################
+###
+### 3- Generating features:
+### 3-1: positive features centered at tss mode
+### 3-2: negative features two sets: 
+### a) features centered at random drawn locs from -2000 to -200 relative to true TSS mode 
+### b) features centered at random drawn locs from exonic regions
+###
+################################
+#%features_pos.rdat: %roe_$(nucs_up).FWD.table %roe_$(nucs_up).REV.table
+%features_pos.rdat: 
+	echo java -Xms100G -Xmx200G -jar software/tfbs_scan.jar GenFeatures --pseudoCounts $(pseudoCounts) -n 48 $(prefix)/roe_$(nucs_up).FWD.table $(prefix)/roe_$(nucs_up).REV.table $(prefix)/peaks_5000_region.fa $(pwm) $(prefix)/features_pos.rdat |\
+		SGE_Array -P 1 -q $(queues) -m 200G -r $(prefix)/j7_gen_features_pos_logs --hold_names $(prefix)/j6_roefinder_logs
+
+%features_train_pos.rdat %features_test_pos.rdat: %features_pos.rdat
+	echo software/split_train_test_features.R $(prefix)/features_pos.rdat $(prefix)/features_train_pos.rdat $(prefix)/features_test_pos.rdat |\
+		SGE_Array -q $(queues) -m 200G -r $(prefix)/j8_split_pos_features_logs --hold_names $(prefix)/j7_gen_features_pos_logs
+
+#%negative_tags.locs: %aligned.peaks.annotated.filtered
+%negative_tags.locs: 
+	echo $(python_bin) software/peat_make_negatives.py $(prefix)/aligned.peaks.annotated.filtered ALL 100 $(nucs_up) \> $(prefix)/negative_tags.locs |\
+		SGE_Array -q $(queues) -m 10G -r $(prefix)/j5.2_get_neg_tags_logs --hold_names $(prefix)/j4_filter_peaks_logs  
+
+
+%peaks_train_neg.csv %peaks_test_neg.csv: %features_train_pos.rdat %features_test_pos.rdat
+	echo software/filter_peaks_for_negatives.sh $(prefix)/features_train_pos.rdat $(prefix)/aligned.peaks.annotated.filtered $(prefix)/negative_tags.locs $(prefix)/peaks_train_neg.csv $(nucs_up) \; software/filter_peaks_for_negatives.sh $(prefix)/features_test_pos.rdat $(prefix)/aligned.peaks.annotated.filtered $(prefix)/negative_tags.locs $(prefix)/peaks_test_neg.csv $(nucs_up) |\
+		SGE_Array -q $(queues) -r $(prefix)/j9_train-test_neg_peaks_logs --hold_names $(prefix)/j8_split_pos_features_logs,$(prefix)/j5.2_get_neg_tags_logs
+
+### Generate negative sequences for negative features
+%peaks_train_neg_$(nucs_up).fa %peaks_test_neg_$(nucs_up).fa: %peaks_train_neg.csv %peaks_test_neg.csv
+	echo software/get_seqs.pl $(prefix)/peaks_train_neg.csv $(nucs_up) $(nucs_down) $(genome) \| software/dedup_fasta.sh \> $(prefix)/peaks_train_neg_$(nucs_up).fa \; software/get_seqs.pl $(prefix)/peaks_test_neg.csv $(nucs_up) $(nucs_down) $(genome) \| software/dedup_fasta.sh \> $(prefix)/peaks_test_neg_$(nucs_up).fa | \
+		SGE_Array -q $(queues) -m 10G -r $(prefix)/j10_neg_peaks_region_train-test_logs --hold_names $(prefix)/j9_train-test_neg_peaks_logs
+	
+### Generate neagteive features
+## 1- We already have "good" non-overlapping tss peaks for choosing our random locations for negative examples.
+## 2- Compute how many draws per sequence is required based on #of pos examples and neg tags
+## Why is 2 required? GenFeatures code takes ndraws which drwas from each equence in negative candidates,
+##     so we need an estimate to understand how many draws per seq is required. Becasue #of negative candidates 
+##     is almost always less than pos tags
+## 3- Adjust and truncate the number of final Negative examples by random selection among output features of 2
+## 4- Draw 1 of each exonic/whole genomic sequences to add to neg examples. These genomic sequences are pre-extracted
+## Almost done with neg examples!!! Yay.....
+#%features_train_neg.rdat: %peaks_train_neg_$(nucs_up).fa %peaks_test_neg_$(nucs_up).fa 
+%features_train_neg.rdat: 
+	echo software/generate_neg_features.sh $(prefix)/features_train_pos.rdat $(prefix)/peaks_train_neg.csv $(negative_proportion) $(negative_draw_start) $(negative_draw_stop) $(pseudoCounts) $(prefix)/roe_$(nucs_up).FWD.table $(prefix)/roe_$(nucs_up).REV.table $(prefix)/peaks_train_neg_$(nucs_up).fa $(pwm) $(prefix)/features_train_neg.rdat $(exonic_seqs) 20 |\
+		SGE_Array -P 10 -q $(queues) -m 50G -r $(prefix)/j11_gene_neg_features_logs --hold_names $(prefix)/j10_neg_peaks_region_train-test_logs
+
+%features_test_neg.rdat:
+	echo software/generate_neg_features.sh $(prefix)/features_test_pos.rdat $(prefix)/peaks_test_neg.csv $(negative_proportion) $(negative_draw_start) $(negative_draw_stop) $(pseudoCounts) $(prefix)/roe_$(nucs_up).FWD.table $(prefix)/roe_$(nucs_up).REV.table $(prefix)/peaks_test_neg_$(nucs_up).fa $(pwm) $(prefix)/features_test_neg.rdat $(whole_genome_seqs) 20 |\
+		SGE_Array -P 10 -q $(queues) -m 50G -r $(prefix)/j11.2_gene_neg_features_test_logs --hold_names $(prefix)/j10_neg_peaks_region_train-test_logs
+
+
+
+
+
+
+
+
