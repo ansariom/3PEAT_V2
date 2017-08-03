@@ -8,44 +8,10 @@ library(tidyr)
 library(PRROC)
 library(rstackdeque)
 library(purrr)
-library(parallel)
 
-
-rm(list = ls())
-#options(scipen=999)
-geometric_mean <- function(x) exp(mean(log(x)))
-
-
-# adds a "class" column of either "leaf_specific" or "root_specific" based
-# on the threshold, assumes the present of column "b" (fold change) and "qval" (Q value)
-# this also removes all unclassed examples
-add_class <- function(input, qval_thresh, fold_thresh) {
-  input$class <- NA
-  input$class[input$qval <= qval_thresh & input$b < -1 * fold_thresh] <- 1#"leaf_specific"
-  input$class[input$qval <= qval_thresh & input$b > fold_thresh] <- 0#"root_specific"
-  input <- input[!is.na(input$class), ]
-  return(input)
-}
-
-
-
-# split dataframe into train (and this into folds), final test
-# works on any data frame
-# rows will be randomized first
-# returns a list; first el being a list of folds (data frames), second being the final test data frame
-split_data <- function(input, percent_train = 0.8, folds = 5) {
-  randomized_features_diffs_wide <- input[order(runif(nrow(input))), ]
-  train_index <- as.integer(percent_train * nrow(randomized_features_diffs_wide))
-  train_features_diffs_wide <- randomized_features_diffs_wide[seq(1, train_index), ]
-  final_test_features_diffs_wide <- randomized_features_diffs_wide[seq(train_index + 1, nrow(randomized_features_diffs_wide)), ]
-  
-  folds_list <- split(train_features_diffs_wide, seq(1,nrow(train_features_diffs_wide)) %% folds)
-  ret_list <- list(train_folds = folds_list, final_test = final_test_features_diffs_wide)
-  return(ret_list)
-}
-
-
-
+##########################################
+## Method Definitions
+##########################################
 # given a name for a fold, and a (named) list of all the folds, extracts
 # that name as the test, the next name as the validation,
 # and the rest as training (collapsed with rbind)
@@ -115,7 +81,7 @@ run_and_validate_model <- function(param, train_validate) {
     print(attr(x_train_set_scaled, "scaled:center"))
     scale_center_outfile <- paste(outdir, "/", model_type, "_x_train_set_scaled.rdat", sep = "")
     save(x_train_set_scaled, file = scale_center_outfile)
-}
+  }
   coefficients <- model$W
   # drop bias coefficient
   coefficients <- coefficients[1:(length(coefficients) - 1)]
@@ -189,90 +155,67 @@ find_pstar <- function(fold_name, params_list, folds_list) {
 # returns a list (of lists) for each fold with lots of goodies
 n_fold_cross <- function(train_folds, possible_params) {
   train_folds_names <- as.list(names(train_folds))
-  #print(train_folds_names)
+  print(train_folds_names)
   bests_by_fold <- lapply(train_folds_names, find_pstar, possible_params, train_folds)
   return(bests_by_fold)
 }
 
 
+##########################################
+## Initialize variables...
+##########################################
 
-####################################
-##  End functions, begin script
-####################################
-args <- commandArgs(trailingOnly = TRUE)
-
-if(length(args) < 5) {
-  print("./cross_validation.R [all_features.rdat] [nfolds] [outdir] [ncpus] [tile_only|roe_only|tile_roe]")
-  quit()
+offline <- FALSE
+if (offline) { 
+    train_infile <- "~/Downloads/features_all_train.rdat"
+    test_infile <- "~/Downloads/features_all_test.rdat"
+    nfolds = 2
+    ncpu = 2
+    outdir = "~/Downloads/"
+} else {
+  args <- commandArgs(trailingOnly = TRUE)
+  
+  if(length(args) < 5) {
+    print("./cross_validation.R [all_features_train.rdat] [all_features_test.rdat] [nfolds] [outdir] [ncpus]")
+    quit()
+  }
+  train_infile = args[1]
+  test_infile = args[2]
+  nfolds = args[3]
+  outdir = args[4]
+  ncpu = args[5]
 }
 
-input_features <- args[1]
-nfolds <- as.numeric(args[2])
-outdir <- args[3]
-ncpu <- as.numeric(args[4])
-model_type = args[5]
-save_model <- FALSE
-
+save_model = FALSE
 # chosen by fair die roll, gauranteed to be random
-set.seed(1298)
-# load the features and differential expression data
-# into all_features_diffs_wide
-load(input_features)
+set.seed(122)
 
-if (model_type == "tile_only") {
-  ### : remove all but tiled features
-  all_features_diffs_wide <- all_features_diffs_wide[, !(grepl("(FWD|REV)", colnames(all_features_diffs_wide)) & !grepl("tile", colnames(all_features_diffs_wide))) ]
-} else if (model_type == "roe_only") {
-  ### or, remove tiled features
-  all_features_diffs_wide <- all_features_diffs_wide[, !grepl("tile", colnames(all_features_diffs_wide)) ]
-} else if (model_type == "oc_only") {
-  missing_cols <- all_features_diffs_wide[,1:15]
-  all_features_diffs_wide <- all_features_diffs_wide[, (grepl("_OC_", colnames(all_features_diffs_wide)) & !grepl("tile", colnames(all_features_diffs_wide))) ]
-  all_features_diffs_wide <- cbind(missing_cols, all_features_diffs_wide)
-} else if (model_type == "tfbs_only" ) {
-  all_features_diffs_wide <- all_features_diffs_wide[, (!grepl("_OC_", colnames(all_features_diffs_wide)) & !grepl("tile", colnames(all_features_diffs_wide))) ]
-} 
+# Load features
+load(train_infile)
+load(test_infile)
 
-# set rownames to tss names
-rownames(all_features_diffs_wide) <- all_features_diffs_wide$tss_name
+features_train$class <- ifelse(features_train$class == -1, 0, 1) 
+features_test$class <- ifelse(features_test$class == -1, 0, 1) 
 
-# define classes, get rid of unclassed columns
-classed_features_diffs_wide <- add_class(all_features_diffs_wide, qval_thresh = 0.05, fold_thres = 4)
+### For test
+#features_test <- features_test[order(runif(nrow(features_test))),]
+#features_test <- features_test[1:5000,]
 
-# NAs were introduced because many TSSs have overall OC features but not others
-## todo: why is this again?
-classed_features_diffs_wide <- classed_features_diffs_wide[complete.cases(classed_features_diffs_wide), ]
-print("Overall class sizes:")
-print(table(classed_features_diffs_wide$class))
+train_folds <- split(features_train, seq(1,nrow(features_train)) %% nfolds)
+names(train_folds)
 
-# strip out the differential expression stuff
-diffs_colnames <- c("gene_id", "pval", "qval", "b", "se_b", "mean_obs", "var_obs", 
-                    "tech_var", "sigma_sq", "smooth_sigma_sq", "final_sigma_sq", 
-                    "tss_name", "chr", "loc", "offset?")
-
-# differential expression data
-classed_diffs_info <- classed_features_diffs_wide[, diffs_colnames]
-# features and class only
-classed_features_class <- classed_features_diffs_wide[, !colnames(classed_features_diffs_wide) %in% diffs_colnames]
-
-
-# split into 80% 8-fold set, and 20% final test
-folds_final_test <- split_data(classed_features_class, percent_train = 0.8, folds = nfolds)
-train_folds <- folds_final_test$train_folds
-
-# # make it all parallel...
+##########################################
+## Cross Validation...
+##########################################
 library(parallel)
 cl <- makeCluster(ncpu)
 clusterExport(cl, list("folds_to_train_validate_test", "train_folds",
-                       "run_and_validate_model", "model_type", "save_model"))
+                       "run_and_validate_model", "save_model"))
 # replace lapply with parLapply
 lapply <- function(...) {parLapply(cl, ...)}
 
-
 # we'll try a bunch of different params
-#possible_params <- as.list(10^seq(-6,-1,0.2))
-possible_params <- as.list(seq(0.0001, 0.003, 0.0002))
-
+possible_params <- as.list(seq(0.0001, 0.002, 0.0001))
 print("trying params:")
 print(unlist(possible_params))
 names(possible_params) <- as.character(possible_params)
@@ -280,79 +223,40 @@ names(possible_params) <- as.character(possible_params)
 print("Start running cross validation ..")
 bests_by_fold <- n_fold_cross(train_folds, possible_params)
 #str(bests_by_fold[1])
-
+stopCluster(cl)
 print("cross-validation done!")
-################################
-####### Cross val done.
-################################
 
 ######### Line plots start
 print("Create Plots ....")
-
 # make it into a table
 # grab everything but the "within_params_list" entries and build a table
 # map_df -> turns some parts of a list into a dataframe - from purrr library
-bestfolds_table <- paste(outdir, "/", model_type ,"_bests_by_folds_param_vs_aurocs.txt", sep = "")
+bestfolds_table <- paste(outdir, "/" , "bests_by_folds_param_vs_aurocs.txt", sep = "")
 bests_by_fold_table <- map_df(bests_by_fold, .f = function(x) {return(x[!names(x) %in% c("within_params_list", "test_coeffs_df", "train_set", "test_set", "best_model")])} )
 write.table(bests_by_fold_table, file = bestfolds_table, quote = F, sep = "\t", row.names = F)
 print(bests_by_fold_table)
 
 pstar_avg <- mean(bests_by_fold_table$best_param)
 print(paste("mean_param = ", pstar_avg, sep = ""))
-param_file <- paste(outdir, "/", model_type, "_param_mean.txt", sep = "")
+param_file <- paste(outdir, "/", "param_mean.txt", sep = "")
 write.table(pstar_avg, param_file, quote = F, row.names = F, col.names = F)
 
 # grab the "within_params_list" entries and build a table
-foldout_table <- paste(outdir, "/", model_type ,"_within_folds_param_vs_aurocs.txt", sep = "")
+foldout_table <- paste(outdir, "/" ,"within_folds_param_vs_aurocs.txt", sep = "")
 within_folds_table <- map_df(map(bests_by_fold, "within_params_list"), I)
 print(as.data.frame(within_folds_table), row.names = FALSE)
 write.table(within_folds_table, file = foldout_table, quote = F, sep = "\t", row.names = F)
 
-foldout_plot <- paste(outdir, "/", model_type ,"_within_folds_param_vs_aurocs.png", sep = "")
+foldout_plot <- paste(outdir, "/" ,"within_folds_param_vs_aurocs.png", sep = "")
 df <- within_folds_table
 df$fold_name <- as.character(df$fold_name)
-plot_title <- paste(model_type, " Features", sep = "")
+plot_title <- paste("", " Features", sep = "")
 g <- ggplot(df) + geom_line(aes(x = param, y = auroc, color = fold_name)) +
   expand_limits(y = c(0.80, 1.0)) +
   ggtitle(plot_title) 
 ggsave(g, filename = foldout_plot)
 
 ######### Line plots end
-
-######## folds_final_test is a list of 2; first is a list of data frames (folds), second is the held out df
-print("Start running heldout test...")
-all_train <- do.call(rbind, folds_final_test$train_folds)
-print(paste("train set size : ", dim(all_train), sep = ""))
-final_test <- folds_final_test$final_test
-print(paste("test set size: ", dim(final_test), sep = ""))
-save_model <- TRUE
-final_res <- run_and_validate_model(pstar_avg, list(all_train, final_test))
-
-perf_out <- paste(outdir, "/", model_type, "_heldoutTest_performance.txt", sep = "")
-perf_df <- data.frame(auroc = final_res$auroc, auprc = final_res$auprc)
-write.table(perf_df, file = perf_out, sep = "\t", row.names = F, quote = F)
-
-#model_file <- paste(outdir, "/", model_type, "_model.rdat", sep = "")
-#save(final_res, file = model_file)
-#print("model saved at: ", model_file, sep = "")
-
-### Test calls
-test_calls_features <- cbind(final_res$model$probabilities, final_res$model$predictions)
-colnames(test_calls_features)[1] <- "prob_class_0"
-colnames(test_calls_features)[2] <- "prob_class_1"
-colnames(test_calls_features)[3] <- "class_call"
-all_input_test_rows <- classed_features_diffs_wide[rownames(classed_features_diffs_wide) %in% rownames(final_test), ]
-
-test_outfile <- paste(outdir, "/", model_type, "_testout.table.txt", sep = "")
-write.table(all_input_test_rows, file = test_outfile, quote = F, sep = "\t")
-print("test is done!")
-
-###### Coefficients table #######
-print("Writing coef tables..")
-coef_df <- final_res$coeffs_df
-coef_df <- coef_df[order(-abs(coef_df$coefficients)),]
-coef_table <- paste(outdir, "/", model_type, "_coef-table.sorted.txt", sep = "")
-write.table(coef_df, file = coef_table, quote = F, row.names = F, sep = "\t")
 
 
 
