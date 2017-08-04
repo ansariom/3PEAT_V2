@@ -42,6 +42,7 @@ folds_to_train_test <- function(test_fold_name, all_folds) {
 # predicted
 # returns: list of 6: param, confusion_matrix, coeffs_df, model, auroc, auprc
 run_and_validate_model <- function(param, train_validate) {
+  print("run and validate")
   #print(paste("run_and_validate_model : model_type = ", model_type, "param = ", param, sep = ""))
   train_set <- train_validate[[1]]
   test_set <- train_validate[[2]]
@@ -108,6 +109,8 @@ run_and_validate_model <- function(param, train_validate) {
 # folds list is a list of data frames
 # returns a list with lots of goodies
 find_pstar <- function(fold_name, params_list, folds_list) {
+  print("find_pstar")
+  print(fold_name)
   train_valid_test <- folds_to_train_validate_test(fold_name, folds_list)
   train_validate <- train_valid_test[c("train_set", "validation_set")]
   
@@ -155,7 +158,7 @@ find_pstar <- function(fold_name, params_list, folds_list) {
 # returns a list (of lists) for each fold with lots of goodies
 n_fold_cross <- function(train_folds, possible_params) {
   train_folds_names <- as.list(names(train_folds))
-  print(train_folds_names)
+  #print(train_folds_names)
   bests_by_fold <- lapply(train_folds_names, find_pstar, possible_params, train_folds)
   return(bests_by_fold)
 }
@@ -181,9 +184,9 @@ if (offline) {
   }
   train_infile = args[1]
   test_infile = args[2]
-  nfolds = args[3]
+  nfolds = as.numeric(args[3])
   outdir = args[4]
-  ncpu = args[5]
+  ncpu = as.numeric(args[5])
 }
 
 save_model = FALSE
@@ -208,8 +211,9 @@ names(train_folds)
 ## Cross Validation...
 ##########################################
 library(parallel)
+
 cl <- makeCluster(ncpu)
-clusterExport(cl, list("folds_to_train_validate_test", "train_folds",
+clusterExport(cl, list("train_folds",
                        "run_and_validate_model", "save_model"))
 # replace lapply with parLapply
 lapply <- function(...) {parLapply(cl, ...)}
@@ -223,7 +227,7 @@ names(possible_params) <- as.character(possible_params)
 print("Start running cross validation ..")
 bests_by_fold <- n_fold_cross(train_folds, possible_params)
 #str(bests_by_fold[1])
-stopCluster(cl)
+#stopCluster(cl)
 print("cross-validation done!")
 
 ######### Line plots start
