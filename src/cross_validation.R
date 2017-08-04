@@ -213,7 +213,7 @@ names(train_folds)
 library(parallel)
 
 cl <- makeCluster(ncpu)
-clusterExport(cl, list("train_folds",
+clusterExport(cl, list("folds_to_train_validate_test" , "train_folds",
                        "run_and_validate_model", "save_model"))
 # replace lapply with parLapply
 lapply <- function(...) {parLapply(cl, ...)}
@@ -230,7 +230,7 @@ bests_by_fold <- n_fold_cross(train_folds, possible_params)
 #stopCluster(cl)
 print("cross-validation done!")
 
-######### Line plots start
+##### Process crossVal results #####
 print("Create Plots ....")
 # make it into a table
 # grab everything but the "within_params_list" entries and build a table
@@ -260,7 +260,43 @@ g <- ggplot(df) + geom_line(aes(x = param, y = auroc, color = fold_name)) +
   ggtitle(plot_title) 
 ggsave(g, filename = foldout_plot)
 
-######### Line plots end
+############################################
+### Independent heldout test
+############################################
+print("Start independent heldout testing ..")
+print(paste("train set size : ", dim(features_train), sep = ""))
+print(paste("test set size: ", dim(features_test), sep = ""))
+save_model <- TRUE
+final_res <- run_and_validate_model(pstar_avg, list(features_train, features_test))
+
+perf_out <- paste(outdir, "/", "heldoutTest_performance.txt", sep = "")
+perf_df <- data.frame(auroc = final_res$auroc, auprc = final_res$auprc)
+write.table(perf_df, file = perf_out, sep = "\t", row.names = F, quote = F)
+
+model_file <- paste(outdir, "/","model.rdat", sep = "")
+save(final_res, file = model_file)
+#print("model saved at: ", model_file, sep = "")
+
+### Test calls
+test_calls_features <- cbind(final_res$model$probabilities, final_res$model$predictions)
+colnames(test_calls_features)[1] <- "prob_class_0"
+colnames(test_calls_features)[2] <- "prob_class_1"
+colnames(test_calls_features)[3] <- "class_call"
+all_input_test_rows <- classed_features_diffs_wide[rownames(classed_features_diffs_wide) %in% rownames(final_test), ]
+
+test_outfile <- paste(outdir, "/","testout.table.txt", sep = "")
+write.table(all_input_test_rows, file = test_outfile, quote = F, sep = "\t")
+print("test is done!")
+
+###### Coefficients table #######
+print("Writing coef tables..")
+coef_df <- final_res$coeffs_df
+coef_df <- coef_df[order(-abs(coef_df$coefficients)),]
+coef_table <- paste(outdir, "/", "coef-table.sorted.txt", sep = "")
+write.table(coef_df, file = coef_table, quote = F, row.names = F, sep = "\t")
+
+
+
 
 
 
